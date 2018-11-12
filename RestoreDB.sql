@@ -280,6 +280,9 @@ END
 CLOSE backupfiles
 DEALLOCATE backupfiles
 
+--Ignore anything that isn't for the requested database.
+DELETE FROM @backups WHERE DatabaseName <> @Database
+
 RAISERROR('Done examining backups.', 0, 1) WITH NOWAIT
 
 IF @Debug = 1
