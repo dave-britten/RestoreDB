@@ -1,6 +1,39 @@
 USE master
 GO
 
+--Create a replacement for STRING_SPLIT if SQL Server version < 2016.
+--This isn't designed for high performance, i.e. don't use it as a load-bearing part of your data warehouse ETL...
+IF CAST(SERVERPROPERTY('ProductMajorVersion') AS decimal(19,5)) < 13 AND NOT EXISTS (SELECT name FROM sys.objects WHERE name = 'STRING_SPLIT')
+	EXEC sp_executesql N'CREATE FUNCTION [STRING_SPLIT] (
+	@string nvarchar(max),
+	@delimiter nchar(1)
+)
+RETURNS @output TABLE (
+	[value] nvarchar(max)
+)
+AS
+BEGIN
+	DECLARE @split int
+	DECLARE @start int
+	SET @split = CHARINDEX(@delimiter, @string, 0)
+	SET @start = 1
+	
+	WHILE @split != 0
+	BEGIN
+		INSERT INTO @output ([value])
+		VALUES (SUBSTRING(@string, @start, @split-@start))
+
+		SET @start = @split + 1
+		SET @split = CHARINDEX(@delimiter, @string, @start)
+	END
+
+	INSERT INTO @output ([value])
+	VALUES (RIGHT(@string, DATALENGTH(@string) / 2 - @start + 1))
+
+	RETURN
+END'
+
+
 IF object_id('dbo.RestoreDB') IS NULL
 	EXEC sp_executesql N'CREATE PROCEDURE dbo.RestoreDB AS SELECT ''Stub'' AS Stub;'
 GO
@@ -30,6 +63,7 @@ SET NOCOUNT ON
 IF @RestoreAs IS NULL
 	SET @RestoreAs = @Database
 
+DECLARE @Version decimal(19,5) = CAST(SERVERPROPERTY('ProductMajorVersion') AS decimal(19,5))
 DECLARE @backupfile nvarchar(4000)
 DECLARE @backupsfound int
 DECLARE @backupschecked int
@@ -265,8 +299,17 @@ FETCH NEXT FROM backupfiles INTO @backupfile
 WHILE @@FETCH_STATUS = 0
 BEGIN
 	SET @sql = 'RESTORE HEADERONLY FROM DISK = ''' + REPLACE(@backupfile, '''', '''''') + ''''
-	INSERT INTO @backups (BackupName, BackupDescription, BackupType, ExpirationDate, Compressed, Position, DeviceType, UserName, ServerName, DatabaseName, DatabaseVersion, DatabaseCreationDate, BackupSize, FirstLSN, LastLSN, CheckpointLSN, DatabaseBackupLSN, BackupStartDate, BackupFinishDate, SortOrder, CodePage, UnicodeLocaleId, UnicodeComparisonStyle, CompatibilityLevel, SoftwareVendorId, SoftwareVersionMajor, SoftwareVersionMinor, SoftwareVersionBuild, MachineName, Flags, BindingID, RecoveryForkID, Collation, FamilyGUID, HasBulkLoggedData, IsSnapshot, IsReadOnly, IsSingleUser, HasBackupChecksums, IsDamaged, BeginsLogChain, HasIncompleteMetadata, IsForceOffline, IsCopyOnly, FirstRecoveryForkID, ForkPointLSN, RecoveryModel, DifferentialBaseLSN, DifferentialBaseGUID, BackupTypeDescription, BackupSetGUID, CompressedBackupSize, containment, KeyAlgorithm, EncryptorThumbprint, EncryptorType)
-	EXEC (@sql)
+
+	IF @Version >= 12 --2014+
+		INSERT INTO @backups (BackupName, BackupDescription, BackupType, ExpirationDate, Compressed, Position, DeviceType, UserName, ServerName, DatabaseName, DatabaseVersion, DatabaseCreationDate, BackupSize, FirstLSN, LastLSN, CheckpointLSN, DatabaseBackupLSN, BackupStartDate, BackupFinishDate, SortOrder, CodePage, UnicodeLocaleId, UnicodeComparisonStyle, CompatibilityLevel, SoftwareVendorId, SoftwareVersionMajor, SoftwareVersionMinor, SoftwareVersionBuild, MachineName, Flags, BindingID, RecoveryForkID, Collation, FamilyGUID, HasBulkLoggedData, IsSnapshot, IsReadOnly, IsSingleUser, HasBackupChecksums, IsDamaged, BeginsLogChain, HasIncompleteMetadata, IsForceOffline, IsCopyOnly, FirstRecoveryForkID, ForkPointLSN, RecoveryModel, DifferentialBaseLSN, DifferentialBaseGUID, BackupTypeDescription, BackupSetGUID, CompressedBackupSize, containment, KeyAlgorithm, EncryptorThumbprint, EncryptorType)
+		EXEC (@sql)
+	ELSE IF @Version >= 11 --2012
+		INSERT INTO @backups (BackupName, BackupDescription, BackupType, ExpirationDate, Compressed, Position, DeviceType, UserName, ServerName, DatabaseName, DatabaseVersion, DatabaseCreationDate, BackupSize, FirstLSN, LastLSN, CheckpointLSN, DatabaseBackupLSN, BackupStartDate, BackupFinishDate, SortOrder, CodePage, UnicodeLocaleId, UnicodeComparisonStyle, CompatibilityLevel, SoftwareVendorId, SoftwareVersionMajor, SoftwareVersionMinor, SoftwareVersionBuild, MachineName, Flags, BindingID, RecoveryForkID, Collation, FamilyGUID, HasBulkLoggedData, IsSnapshot, IsReadOnly, IsSingleUser, HasBackupChecksums, IsDamaged, BeginsLogChain, HasIncompleteMetadata, IsForceOffline, IsCopyOnly, FirstRecoveryForkID, ForkPointLSN, RecoveryModel, DifferentialBaseLSN, DifferentialBaseGUID, BackupTypeDescription, BackupSetGUID, CompressedBackupSize, containment)
+		EXEC (@sql)
+	ELSE
+		INSERT INTO @backups (BackupName, BackupDescription, BackupType, ExpirationDate, Compressed, Position, DeviceType, UserName, ServerName, DatabaseName, DatabaseVersion, DatabaseCreationDate, BackupSize, FirstLSN, LastLSN, CheckpointLSN, DatabaseBackupLSN, BackupStartDate, BackupFinishDate, SortOrder, CodePage, UnicodeLocaleId, UnicodeComparisonStyle, CompatibilityLevel, SoftwareVendorId, SoftwareVersionMajor, SoftwareVersionMinor, SoftwareVersionBuild, MachineName, Flags, BindingID, RecoveryForkID, Collation, FamilyGUID, HasBulkLoggedData, IsSnapshot, IsReadOnly, IsSingleUser, HasBackupChecksums, IsDamaged, BeginsLogChain, HasIncompleteMetadata, IsForceOffline, IsCopyOnly, FirstRecoveryForkID, ForkPointLSN, RecoveryModel, DifferentialBaseLSN, DifferentialBaseGUID, BackupTypeDescription, BackupSetGUID, CompressedBackupSize)
+		EXEC (@sql)
+
 	UPDATE @backups SET Filename = @backupfile WHERE Filename IS NULL
 
 	SET @backupschecked = @backupschecked + 1
@@ -362,8 +405,13 @@ END
 IF @AutoMove = 1 OR @MoveDataFilesTo IS NOT NULL OR @MoveLogFilesTo IS NOT NULL OR (@AutoRename = 1 AND @Database <> @RestoreAs)
 BEGIN
 	SET @sql = 'RESTORE FILELISTONLY FROM DISK = ''' + REPLACE(@fullfile, '''', '''''') + ''''
-	INSERT INTO @files
-	EXEC (@sql)
+
+	IF @Version >= 13
+		INSERT INTO @files (LogicalName, PhysicalName, Type, FileGroupName, Size, MaxSize, FileID, CreateLSN, DropLSN, UniqueID, ReadOnlyLSN, ReadWriteLSN, BackupSizeInBytes, SourceBlockSize, FileGroupID, LogGroupGUID, DifferentialBaseLSN, DifferentialBaseGUID, IsReadOnly, IsPresent, TDEThumbprint, SnapshotURL)
+		EXEC (@sql)
+	ELSE
+		INSERT INTO @files (LogicalName, PhysicalName, Type, FileGroupName, Size, MaxSize, FileID, CreateLSN, DropLSN, UniqueID, ReadOnlyLSN, ReadWriteLSN, BackupSizeInBytes, SourceBlockSize, FileGroupID, LogGroupGUID, DifferentialBaseLSN, DifferentialBaseGUID, IsReadOnly, IsPresent, TDEThumbprint)
+		EXEC (@sql)
 
 	--Extract the filename without path.
 	UPDATE @files SET PhysicalName = RIGHT(PhysicalName, CHARINDEX('\', ISNULL(REVERSE(PhysicalName), '') + '\') - 1)
