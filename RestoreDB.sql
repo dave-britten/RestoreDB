@@ -422,7 +422,11 @@ BEGIN
 END
 
 --Generate the full restore statement.
-SET @sql = 'RESTORE DATABASE ' + QUOTENAME(@RestoreAs) + ' FROM DISK = ''' + REPLACE(@fullfile, '''', '''''') + ''' WITH FILE = ' + CAST(@fullpos AS varchar(10))
+SET @sql = ''
+IF @dbexists = 1
+SET @sql = @sql + 'ALTER DATABASE ' + QUOTENAME(@RestoreAs) + ' SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+'
+SET @sql = @sql + 'RESTORE DATABASE ' + QUOTENAME(@RestoreAs) + ' FROM DISK = ''' + REPLACE(@fullfile, '''', '''''') + ''' WITH FILE = ' + CAST(@fullpos AS varchar(10))
 
 IF @Replace = 1 AND @dbexists = 1
 	SET @sql = @sql + ', REPLACE'
@@ -530,7 +534,7 @@ BEGIN
 		EXEC (@sql)
 		IF @@ERROR <> 0
 		BEGIN
-			RAISERROR('Failed to restore transaction log backup. The preceding error messages, if any, may indicate the cause of failure.', 16, 3) WITH NOWAIT
+			RAISERROR('Failed to restore transaction log backup. The preceding error messages, if any, may indicate the cause of failure.', 16, 4) WITH NOWAIT
 			CLOSE logfiles
 			DEALLOCATE logfiles
 			RETURN 3
@@ -543,3 +547,17 @@ END
 CLOSE logfiles
 DEALLOCATE logfiles
 
+IF @dbexists = 1 AND (SELECT state FROM sys.databases WHERE name = @RestoreAs) = 0
+BEGIN
+	SET @sql = 'ALTER DATABASE ' + QUOTENAME(@RestoreAs) + ' SET MULTI_USER;'
+	RAISERROR('%s', 0, 1, @sql) WITH NOWAIT
+	IF @WhatIf = 0
+	BEGIN
+		EXEC (@sql)
+		IF @@ERROR <> 0
+		BEGIN
+			RAISERROR('Failed to put database into MULTI_USER mode.', 16, 5) WITH NOWAIT
+			RETURN 3
+		END
+	END
+END
