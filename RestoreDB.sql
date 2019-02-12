@@ -221,6 +221,14 @@ DECLARE @files TABLE (
 	SnapshotURL varchar(360)
 )
 
+DECLARE @movefiles TABLE (
+	LogicalName nvarchar(128) NOT NULL,
+	Type char(1) NOT NULL,
+	PhysicalName nvarchar(260) NOT NULL,
+	FullPath nvarchar(260) NOT NULL,
+	NewPath nvarchar(260) NOT NULL
+)
+
 --Find files in the source paths.
 RAISERROR('Finding backup files...', 0, 1) WITH NOWAIT
 
@@ -401,25 +409,24 @@ BEGIN
 	SET @RestoreFullWith = REPLACE(@RestoreFullWith, '[logdir]', @logdir)
 END
 
---If files are going to be moved/renamed automatically, then we need to get the list of database files from the full backup first.
-IF @AutoMove = 1 OR @MoveDataFilesTo IS NOT NULL OR @MoveLogFilesTo IS NOT NULL OR (@AutoRename = 1 AND @Database <> @RestoreAs)
-BEGIN
-	SET @sql = 'RESTORE FILELISTONLY FROM DISK = ''' + REPLACE(@fullfile, '''', '''''') + ''''
+SET @sql = 'RESTORE FILELISTONLY FROM DISK = ''' + REPLACE(@fullfile, '''', '''''') + ''''
 
-	IF @Version >= 13
-		INSERT INTO @files (LogicalName, PhysicalName, Type, FileGroupName, Size, MaxSize, FileID, CreateLSN, DropLSN, UniqueID, ReadOnlyLSN, ReadWriteLSN, BackupSizeInBytes, SourceBlockSize, FileGroupID, LogGroupGUID, DifferentialBaseLSN, DifferentialBaseGUID, IsReadOnly, IsPresent, TDEThumbprint, SnapshotURL)
-		EXEC (@sql)
-	ELSE
-		INSERT INTO @files (LogicalName, PhysicalName, Type, FileGroupName, Size, MaxSize, FileID, CreateLSN, DropLSN, UniqueID, ReadOnlyLSN, ReadWriteLSN, BackupSizeInBytes, SourceBlockSize, FileGroupID, LogGroupGUID, DifferentialBaseLSN, DifferentialBaseGUID, IsReadOnly, IsPresent, TDEThumbprint)
-		EXEC (@sql)
+IF @Version >= 13
+	INSERT INTO @files (LogicalName, PhysicalName, Type, FileGroupName, Size, MaxSize, FileID, CreateLSN, DropLSN, UniqueID, ReadOnlyLSN, ReadWriteLSN, BackupSizeInBytes, SourceBlockSize, FileGroupID, LogGroupGUID, DifferentialBaseLSN, DifferentialBaseGUID, IsReadOnly, IsPresent, TDEThumbprint, SnapshotURL)
+	EXEC (@sql)
+ELSE
+	INSERT INTO @files (LogicalName, PhysicalName, Type, FileGroupName, Size, MaxSize, FileID, CreateLSN, DropLSN, UniqueID, ReadOnlyLSN, ReadWriteLSN, BackupSizeInBytes, SourceBlockSize, FileGroupID, LogGroupGUID, DifferentialBaseLSN, DifferentialBaseGUID, IsReadOnly, IsPresent, TDEThumbprint)
+	EXEC (@sql)
 
-	--Extract the filename without path.
-	UPDATE @files SET PhysicalName = RIGHT(PhysicalName, CHARINDEX('\', ISNULL(REVERSE(PhysicalName), '') + '\') - 1)
+INSERT INTO @movefiles (LogicalName, Type, FullPath, NewPath, PhysicalName)
+SELECT LogicalName, Type, PhysicalName, PhysicalName, RIGHT(PhysicalName, CHARINDEX('\', ISNULL(REVERSE(PhysicalName), '') + '\') - 1)
+FROM @files
 
-	--Change any occurrences of the original database name to the @RestoreAs database name within the database filenames.
-	IF (@AutoRename = 1 AND @Database <> @RestoreAs)
-		UPDATE @files SET PhysicalName = REPLACE(PhysicalName, @Database, @RestoreAs)
-END
+--Change any occurrences of the original database name to the @RestoreAs database name within the database filenames.
+IF (@AutoRename = 1 AND @Database <> @RestoreAs)
+	UPDATE @movefiles
+	SET PhysicalName = REPLACE(PhysicalName, @Database, @RestoreAs),
+		NewPath = REPLACE(NewPath, @Database, @RestoreAs)
 
 --Generate the full restore statement.
 SET @sql = ''
@@ -432,18 +439,25 @@ IF @Replace = 1 AND @dbexists = 1
 	SET @sql = @sql + ', REPLACE'
 
 IF @AutoMove = 1
-	SELECT @sql = @sql + ', MOVE ''' + REPLACE(LogicalName, '''', '''''') + ''' TO ''' + REPLACE(CASE WHEN Type = 'L' THEN @logdir ELSE @datadir END + '\' + PhysicalName, '''', '''''') + ''''
-	FROM @files
+	UPDATE @movefiles
+	SET NewPath = CASE WHEN Type = 'L' THEN @logdir ELSE @datadir END + '\' + PhysicalName
 
 IF @MoveDataFilesTo IS NOT NULL
-	SELECT @sql = @sql + ', MOVE ''' + REPLACE(LogicalName, '''', '''''') + ''' TO ''' + REPLACE(REPLACE(REPLACE(@MoveDataFilesTo, '[datadir]', @datadir), '[logdir]', @logdir) + '\' + PhysicalName, '''', '''''') + ''''
-	FROM @files
+	UPDATE @movefiles
+	SET NewPath = REPLACE(REPLACE(@MoveDataFilesTo, '[datadir]', @datadir), '[logdir]', @logdir) + '\' + PhysicalName
 	WHERE Type <> 'L'
 
 IF @MoveLogFilesTo IS NOT NULL
-	SELECT @sql = @sql + ', MOVE ''' + REPLACE(LogicalName, '''', '''''') + ''' TO ''' + REPLACE(REPLACE(REPLACE(@MoveLogFilesTo, '[datadir]', @datadir), '[logdir]', @logdir) + '\' + PhysicalName, '''', '''''') + ''''
-	FROM @files
+	UPDATE @movefiles
+	SET NewPath = REPLACE(REPLACE(@MoveLogFilesTo, '[datadir]', @datadir), '[logdir]', @logdir) + '\' + PhysicalName
 	WHERE Type = 'L'
+
+IF @debug = 1
+	SELECT * FROM @movefiles
+
+SELECT @sql = @sql + ', MOVE ''' + REPLACE(LogicalName, '''', '''''') + ''' TO ''' + REPLACE(NewPath, '''', '''''') + ''''
+FROM @movefiles
+WHERE FullPath <> NewPath
 
 IF @difffile IS NOT NULL OR EXISTS (SELECT id FROM @logfiles) OR @NoRecovery = 1 --Will we be restoring differential or transaction log backups, or has the user requested WITH NORECOVERY?
 	SET @sql = @sql + ', NORECOVERY'
