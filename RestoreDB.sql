@@ -108,6 +108,10 @@ DECLARE @stopped bit
 DECLARE @datadir varchar(max) = CAST(serverproperty('InstanceDefaultDataPath') AS varchar(max))
 DECLARE @logdir varchar(max) = CAST(serverproperty('InstanceDefaultLogPath') AS varchar(max))
 
+--Has to come from xp_instance_regread; won't attempt this unless necessary.
+DECLARE @backupdir varchar(max)
+DECLARE @regread TABLE (Value nvarchar(4000), Data nvarchar(4000))
+
 SET @datadir = LEFT(@datadir, LEN(@datadir) - 1) -- Remove '\'
 SET @logdir = LEFT(@logdir, LEN(@logdir) - 1)
 
@@ -118,6 +122,16 @@ DECLARE @paths TABLE (
 )
 DECLARE @dir nvarchar(1000)
 DECLARE @depth int
+
+IF CHARINDEX('[backupdir]', @Source, 1) > 0
+BEGIN
+	INSERT INTO @regread (Value, Data)
+	EXEC [master].dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\Microsoft\MSSQLServer\MSSQLServer', N'BackupDirectory'
+
+	SELECT TOP 1 @backupdir = Data FROM @regread WHERE Value = 'BackupDirectory'
+
+	SET @Source = REPLACE(@Source, '[backupdir]', ISNULL(@backupdir, ''))
+END
 
 INSERT INTO @paths (dir) SELECT value FROM STRING_SPLIT(@Source, ',')
 
