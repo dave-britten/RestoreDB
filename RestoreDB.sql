@@ -72,8 +72,13 @@ DECLARE @sql nvarchar(max)
 
 --Check if the database being restored as exists. Needed for determining whether to use the WITH REPLACE option.
 DECLARE @dbexists bit = 0
+DECLARE @dbisrestoring bit = 0
 IF EXISTS (SELECT name FROM master.sys.databases WHERE name = @RestoreAs)
+BEGIN
 	SET @dbexists = 1
+	IF EXISTS (SELECT name FROM master.sys.databases WHERE name = @RestoreAs AND (state_desc = 'RESTORING' OR is_in_standby = 1))
+		SET @dbisrestoring = 1
+END
 
 --Cursor-reading variables.
 DECLARE @fullfile nvarchar(4000)
@@ -136,6 +141,19 @@ END
 INSERT INTO @paths (dir) SELECT value FROM STRING_SPLIT(@Source, ',')
 
 UPDATE @paths SET dir = STUFF(dir, 1, 1, ''), depth = 0 WHERE dir LIKE '+%'
+
+--Replace path tokens in parameters
+IF @RestoreFullWith IS NOT NULL
+BEGIN
+	SET @RestoreFullWith = REPLACE(@RestoreFullWith, '[datadir]', @datadir)
+	SET @RestoreFullWith = REPLACE(@RestoreFullWith, '[logdir]', @logdir)
+END
+
+IF @Standby IS NOT NULL
+BEGIN
+	SET @Standby = REPLACE(@Standby, '[datadir]', @datadir)
+	SET @Standby = REPLACE(@Standby, '[logdir]', @logdir)
+END
 
 --Results from xp_dirtree.
 DECLARE @dirtree TABLE (
@@ -353,34 +371,69 @@ RAISERROR('Done examining backups.', 0, 1) WITH NOWAIT
 IF @Debug = 1
 	SELECT * FROM @backups
 
---If the user supplied a STOPAT time, then ignore any full/differential backups that finished after that time.
-IF @StopAt IS NOT NULL
-DELETE FROM @backups WHERE BackupFinishDate > @StopAt AND BackupTypeDescription <> 'Transaction Log'
+DELETE FROM @backups WHERE BackupFinishDate > @StopAt AND BackupTypeDescription = 'DATABASE DIFFERENTIAL'
 
---Find the full backup to start from.
-SELECT TOP 1 @fullfile = Filename, @fullpos = Position, @fullfirstlsn = FirstLSN, @fulllastlsn = LastLSN, @fullfinish = BackupFinishDate
-FROM @backups
-WHERE BackupTypeDescription = 'Database'
-ORDER BY BackupFinishDate DESC
-
-IF @fullfile IS NULL
+IF @dbisrestoring = 0
 BEGIN
-	RAISERROR('Could not find a full backup that completed before the supplied @StopAt time.', 16, 1)
-	RETURN 1
+	--Find the full backup to start from.
+	SELECT TOP 1 @fullfile = Filename, @fullpos = Position, @fullfirstlsn = FirstLSN, @fulllastlsn = LastLSN, @fullfinish = BackupFinishDate
+	FROM @backups
+	WHERE BackupTypeDescription = 'Database'
+		AND (@StopAt IS NULL OR BackupFinishDate <= @StopAt)
+	ORDER BY BackupFinishDate DESC
+
+	--Try ignoring @StopAt and using the oldest available full backup
+	IF @fullfile IS NULL AND @StopAt IS NOT NULL
+	BEGIN
+		SELECT TOP 1 @fullfile = Filename, @fullpos = Position, @fullfirstlsn = FirstLSN, @fulllastlsn = LastLSN, @fullfinish = BackupFinishDate
+		FROM @backups
+		WHERE BackupTypeDescription = 'Database'
+		ORDER BY BackupFinishDate ASC
+	END
+
+	IF @fullfile IS NULL
+	BEGIN
+		RAISERROR('Could not find a full backup.', 16, 1)
+		RETURN 1
+	END
+
+	IF @fullfinish > @StopAt
+	BEGIN
+		RAISERROR('Warning: Oldest available full backup completed after the supplied @StopAt time.', 10, 1)
+	END
+
+	--Find a differential backup.
+	SELECT TOP 1 @difffile = Filename, @diffpos = Position, @difffirstlsn = FirstLSN, @difflastlsn = LastLSN, @difffinish = BackupFinishDate
+	FROM @backups
+	WHERE DifferentialBaseLSN = @fullfirstlsn
+		AND BackupTypeDescription = 'Database Differential'
+		AND (@StopAt IS NULL OR BackupFinishDate <= @StopAt)
+	ORDER BY BackupFinishDate DESC
 END
+ELSE
+BEGIN
+	RAISERROR('Database is currently in a restoring state. Full backups will be ignored.', 0, 1)
 
---Find a differential backup.
-SELECT TOP 1 @difffile = Filename, @diffpos = Position, @difffirstlsn = FirstLSN, @difflastlsn = LastLSN, @difffinish = BackupFinishDate
-FROM @backups
-WHERE DifferentialBaseLSN = @fullfirstlsn
-	AND BackupTypeDescription = 'Database Differential'
-ORDER BY BackupFinishDate DESC
+	SELECT @fullfirstlsn = MIN(redo_start_lsn) FROM master.sys.master_files WHERE database_id = DB_ID(@RestoreAs) AND type_desc = 'ROWS'
 
+	--See if a differential backup could possibly be used (i.e. all data files have the same differential base LSN).
+	IF (SELECT COUNT(DISTINCT differential_base_lsn) FROM master.sys.master_files WHERE database_id = DB_ID(@RestoreAs) AND type_desc = 'ROWS') = 1
+		--Find a differential backup.
+		SELECT TOP 1 @difffile = Filename, @diffpos = Position, @difffirstlsn = FirstLSN, @difflastlsn = LastLSN, @difffinish = BackupFinishDate
+		FROM @backups
+		WHERE DifferentialBaseLSN = (SELECT differential_base_lsn FROM master.sys.master_files WHERE database_id = DB_ID(@RestoreAs) AND type_desc = 'ROWS' GROUP BY differential_base_lsn)
+			AND BackupTypeDescription = 'Database Differential'
+			AND (@StopAt IS NULL OR BackupFinishDate <= @StopAt)
+		ORDER BY BackupFinishDate DESC
+END
 IF @Debug = 1
 	SELECT @fullfile, @difffile
 
 --Start looking for the log chain, starting from the full or differential backup.
 SET @lastlsn = ISNULL(@difflastlsn, @fulllastlsn)
+
+IF @Debug = 1
+	PRINT 'Last LSN: ' + CAST(@lastlsn AS varchar(50))
 
 SET @logfinish = NULL
 WHILE 1 = 1
@@ -393,6 +446,12 @@ BEGIN
 		AND LastLSN > @lastlsn
 		AND BackupTypeDescription = 'Transaction Log'
 	ORDER BY FirstLSN ASC
+
+	IF @Debug = 1
+	BEGIN
+		PRINT @logfile
+		PRINT 'Last LSN: ' + CAST(@lastlsn AS varchar(50))
+	END
 
 	--No more logs, all done.
 	IF @logfile IS NULL
@@ -415,13 +474,6 @@ IF @Debug = 1
 	SELECT * FROM @logfiles ORDER BY id
 
 --We now have enough info to start restoring.
-
---Replace [datadir] and [logdir] tokens with instance default directories in the user-supplied WITH options.
-IF @RestoreFullWith IS NOT NULL
-BEGIN
-	SET @RestoreFullWith = REPLACE(@RestoreFullWith, '[datadir]', @datadir)
-	SET @RestoreFullWith = REPLACE(@RestoreFullWith, '[logdir]', @logdir)
-END
 
 SET @sql = 'RESTORE FILELISTONLY FROM DISK = ''' + REPLACE(@fullfile, '''', '''''') + ''''
 
